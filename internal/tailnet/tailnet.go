@@ -15,8 +15,9 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
+
+	"github.com/itsgg/pagir/internal/platform"
 )
 
 // Status is the part of `tailscale status --json` pagir reads.
@@ -167,11 +168,7 @@ func MountCommand(public bool, httpsPort int, target string) *exec.Cmd {
 	if public {
 		verb = "funnel"
 	}
-	cmd := exec.Command("tailscale", verb, fmt.Sprintf("--https=%d", httpsPort), target)
-	// Its own process group keeps a terminal's Ctrl+C away from it, so the
-	// hub decides when it stops; Pdeathsig takes it down if the hub is killed.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGTERM}
-	return cmd
+	return exec.Command(platform.Tailscale(), verb, fmt.Sprintf("--https=%d", httpsPort), target)
 }
 
 // Operator returns the user tailscaled lets change its config without root.
@@ -207,8 +204,9 @@ func PublicDNS(ctx context.Context, host string) ([]string, error) {
 // funnel on its own schedule, so for a while after one starts some addresses
 // answer and others do not; one answer proves little. An address this
 // machine cannot route to at all, such as IPv6 without IPv6, is left out.
-// It returns how many addresses answered out of how many were tried.
-func WaitPublic(ctx context.Context, host, url string, wait time.Duration) (answered, tried int, err error) {
+// It returns how many addresses answered out of how many were tried, and
+// reports the same after every round to progress, which may be nil.
+func WaitPublic(ctx context.Context, host, url string, wait time.Duration, progress func(answered, tried int)) (answered, tried int, err error) {
 	addrs, err := PublicDNS(ctx, host)
 	if err != nil || len(addrs) == 0 {
 		return 0, 0, fmt.Errorf("%s has no public DNS record", host)
@@ -247,6 +245,9 @@ func WaitPublic(ctx context.Context, host, url string, wait time.Duration) (answ
 			}()
 		}
 		wg.Wait()
+		if progress != nil {
+			progress(tried-len(pending), tried)
+		}
 		if len(pending) == 0 {
 			if tried == 0 {
 				return 0, 0, errors.New("no public address is reachable from this machine")
@@ -260,6 +261,10 @@ func WaitPublic(ctx context.Context, host, url string, wait time.Duration) (answ
 		}
 	}
 }
+
+// ProbeAgent is the User-Agent of pagir's own checks, which the hub leaves
+// out of access logs.
+const ProbeAgent = "pagir-probe"
 
 // probe sends a HEAD for url to one address. Any reply from the share
 // counts, including a password prompt or a redirect.
@@ -281,6 +286,7 @@ func probe(ctx context.Context, addr, url string) error {
 	if err != nil {
 		return err
 	}
+	req.Header.Set("User-Agent", ProbeAgent)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -292,15 +298,13 @@ func probe(ctx context.Context, addr, url string) error {
 	return nil
 }
 
-func unroutable(err error) bool {
-	return errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.EADDRNOTAVAIL)
-}
+func unroutable(err error) bool { return platform.Unroutable(err) }
 
 func run(ctx context.Context, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, "tailscale", args...)
+	cmd := exec.CommandContext(ctx, platform.Tailscale(), args...)
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if errors.Is(err, exec.ErrNotFound) {

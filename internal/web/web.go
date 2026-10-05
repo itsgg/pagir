@@ -34,6 +34,7 @@ type Config struct {
 	Hidden   bool   // serve dotfiles
 	Password string // non-empty: HTTP basic auth with this password, any user
 	Log      *log.Logger
+	Unlogged func(*http.Request) bool // requests to leave out of Log, such as pagir's own checks
 }
 
 // Server is an http.Handler for one share. Close releases the folder handle.
@@ -77,7 +78,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	lw := &logWriter{ResponseWriter: w, status: http.StatusOK}
 	s.serve(lw, r)
-	if s.c.Log != nil {
+	if s.c.Log != nil && (s.c.Unlogged == nil || !s.c.Unlogged(r)) {
 		who := r.Header.Get("X-Forwarded-For")
 		if who == "" {
 			who = r.RemoteAddr

@@ -35,3 +35,18 @@ func TestRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoveHubOnlyRemovesItsOwn(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if err := SaveHub(&Hub{PID: 200}); err != nil {
+		t.Fatal(err)
+	}
+	RemoveHub(100) // an older hub, gone without its supervisor
+	if !HubWritten() {
+		t.Fatal("a hub removed another hub's hub.json")
+	}
+	RemoveHub(200)
+	if HubWritten() {
+		t.Fatal("a hub left its own hub.json behind")
+	}
+}

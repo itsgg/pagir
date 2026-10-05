@@ -12,24 +12,27 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/itsgg/pagir/internal/platform"
 	"github.com/itsgg/pagir/internal/record"
 	"github.com/itsgg/pagir/internal/tailnet"
 	"github.com/itsgg/pagir/internal/web"
 )
 
 const (
-	hubUnit      = "pagir.service"
 	publicHTTPS  = 443  // Funnel's port for public shares
 	tailnetHTTPS = 8443 // tailnet-only shares; a funnel on 443 would make them public
 	hubTick      = time.Second
-	hubIdle      = 10 * time.Second // exit once no share has been wanted for this long
 	mountWait    = 60 * time.Second
 	childBackoff = 3 * time.Second
+	publicWatch  = 5 * time.Minute  // how long the hub checks a new share's public addresses
+	attachedFor  = 10 * time.Second // a foreground share whose terminal has not touched it for this long is over
+	bootSlack    = time.Minute      // boot time moves with the wall clock; small steps must not drop live shares
 )
 
 // The hub serves every share. tailscaled allows one foreground listener per
@@ -37,11 +40,11 @@ const (
 // owns 443 through one foreground `tailscale funnel` and 8443 through one
 // `tailscale serve`, both proxying to its own local listeners, and routes
 // each request by the token in its first path segment. It starts with the
-// first share and exits after the last, so nothing listens on 443 while
-// nothing is shared, and a crash still leaves nothing published.
+// first share and keeps the funnel up after the last, because Funnel's
+// ingress nodes take up to two minutes to learn of a funnel that was off;
+// `pagir stop hub` ends it. A crash still leaves nothing published.
 type hub struct {
 	host   string
-	boot   string
 	logger *log.Logger
 	lanes  [2]*lane // public, tailnet
 
@@ -50,12 +53,24 @@ type hub struct {
 	byID   map[string]*live
 	failed map[string]string // id: why web.New refused it
 
-	last []byte // hub.json as last written
+	last     []byte    // hub.json as last written
+	lastSync time.Time // when sync last ran, to notice the machine slept
 }
 
 type live struct {
-	rec *record.Share
-	srv *web.Server
+	rec   *record.Share
+	srv   *web.Server
+	check *publicCheck // nil until the share's lane is mounted
+}
+
+// publicCheck follows one public share's addresses until all answer.
+type publicCheck struct {
+	cancel      context.CancelFunc
+	started     time.Time
+	took        time.Duration
+	reached, of int
+	done        bool
+	err         string
 }
 
 // lane is one local listener and the tailscale child that publishes it.
@@ -89,8 +104,9 @@ func (l *lane) target() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", l.ln.Addr().(*net.TCPAddr).Port)
 }
 
+// cmdHub is the hub itself, run by the supervisor; stdout is hub.log.
 func cmdHub() {
-	logger := log.New(os.Stderr, "", 0) // the journal adds the time
+	logger := newLogger(os.Stdout)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	st, err := tailnet.GetStatus(ctx)
@@ -99,7 +115,6 @@ func cmdHub() {
 	}
 	h := &hub{
 		host:   st.Host(),
-		boot:   record.CurrentBoot(),
 		logger: logger,
 		byTok:  map[string]*live{},
 		byID:   map[string]*live{},
@@ -120,16 +135,23 @@ func cmdHub() {
 	defer h.shutdown()
 
 	logger.Printf("hub up for %s", h.host)
-	idle := time.Now()
+	parent := os.Getppid()
 	tick := time.NewTicker(hubTick)
 	defer tick.Stop()
 	for {
-		if h.sync(ctx) > 0 {
-			idle = time.Now()
-		} else if time.Since(idle) > hubIdle {
-			logger.Print("no shares left")
+		if hubStopAsked() {
+			logger.Print("stopped")
 			return
 		}
+		// Without its supervisor the lock is gone and a new hub may start,
+		// so this one must go: Pdeathsig does it on Linux and a job object
+		// on Windows; this check is what does it on macOS (on Windows the
+		// parent pid never changes, so it never fires there).
+		if os.Getppid() != parent {
+			logger.Print("the supervisor is gone; stopping")
+			return
+		}
+		h.sync(ctx)
 		select {
 		case <-ctx.Done():
 			logger.Print("stopped")
@@ -156,24 +178,31 @@ func (h *hub) route(public bool) http.Handler {
 	})
 }
 
-// sync makes the hub serve exactly the shares the records ask for, and
-// returns how many that is.
-func (h *hub) sync(ctx context.Context) int {
+// sync makes the hub serve exactly the shares the records ask for.
+func (h *hub) sync(ctx context.Context) {
 	recs, err := record.List()
 	if err != nil {
 		h.logger.Print(err)
 	}
 	now := time.Now()
+	// After a sleep or a clock step the hub may run before a foreground
+	// terminal has had its turn to touch its record; give it one tick. Wall
+	// clock on purpose: the monotonic clock stops while the machine sleeps,
+	// and the record's mtime, which Age reads, does not.
+	wall := now.Round(0)
+	slept := !h.lastSync.IsZero() && wall.Sub(h.lastSync) > attachedFor/2
+	h.lastSync = wall
+	boot, knowBoot := platform.BootTime()
 	want := map[string]*record.Share{}
 	for _, rec := range recs {
 		switch {
-		case rec.Boot != h.boot:
+		case knowBoot && rec.Created.Before(boot.Add(-bootSlack)):
 			record.Remove(rec.ID)
 			h.logger.Printf("%s dropped: made before the last reboot", rec.ID)
 		case rec.Expired(now):
 			record.Remove(rec.ID)
 			h.logger.Printf("%s expired", rec.ID)
-		case rec.Foreground && !processIsPagir(rec.Owner):
+		case rec.Foreground && !slept && record.Age(rec.ID) > attachedFor:
 			record.Remove(rec.ID)
 			h.logger.Printf("%s ended with its terminal", rec.ID)
 		default:
@@ -186,6 +215,7 @@ func (h *hub) sync(ctx context.Context) int {
 		if w, ok := want[id]; !ok || w.Token != s.rec.Token {
 			delete(h.byID, id)
 			delete(h.byTok, s.rec.Token)
+			s.stopCheck()
 			s.srv.Close()
 			h.logger.Printf("%s stopped", id)
 		}
@@ -205,7 +235,8 @@ func (h *hub) sync(ctx context.Context) int {
 			Upload:   rec.Upload,
 			Hidden:   rec.Hidden,
 			Password: rec.Password,
-			Log:      log.New(h.logger.Writer(), id+" ", 0),
+			Log:      shareLogger(h.logger.Writer(), id),
+			Unlogged: func(r *http.Request) bool { return r.UserAgent() == tailnet.ProbeAgent },
 		})
 		if err != nil {
 			h.failed[id] = err.Error()
@@ -216,7 +247,9 @@ func (h *hub) sync(ctx context.Context) int {
 		h.byID[id], h.byTok[rec.Token] = s, s
 		h.logger.Printf("%s sharing %s", id, rec.Path)
 	}
-	var need [2]bool
+	// The public lane stays up with no shares, so the next share is public
+	// at once instead of after the ingress nodes relearn the funnel.
+	need := [2]bool{true, false}
 	for _, s := range h.byID {
 		need[lane0(s.rec.Public)] = true
 	}
@@ -225,8 +258,75 @@ func (h *hub) sync(ctx context.Context) int {
 	for i, l := range h.lanes {
 		h.tend(ctx, l, need[i])
 	}
+	h.checkPublic(ctx)
 	h.publish(want)
-	return len(want)
+}
+
+// checkPublic starts a public check for each public share once its lane is
+// mounted, drops the checks of a lane that lost its mount (a remount is cold
+// again), and sends the notifications the CLI asked for once a check ends.
+func (h *hub) checkPublic(ctx context.Context) {
+	mounted := h.lanes[0].mounted
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, s := range h.byID {
+		if !s.rec.Public {
+			continue
+		}
+		switch {
+		case !mounted:
+			s.stopCheck()
+		case s.check == nil:
+			cctx, cancel := context.WithCancel(ctx)
+			c := &publicCheck{cancel: cancel, started: time.Now()}
+			s.check = c
+			go h.runCheck(cctx, s.rec, c)
+		case s.check.done && record.TakeNotify(id):
+			go notify(s.rec, *s.check)
+		}
+	}
+}
+
+func (h *hub) runCheck(ctx context.Context, rec *record.Share, c *publicCheck) {
+	reached, of, err := tailnet.WaitPublic(ctx, h.host, rec.URL, publicWatch, func(reached, of int) {
+		h.mu.Lock()
+		c.reached, c.of = reached, of
+		h.mu.Unlock()
+	})
+	if ctx.Err() != nil {
+		return // the share ended or its lane lost the mount
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c.reached, c.of, c.done = reached, of, true
+	c.took = time.Since(c.started).Round(time.Second)
+	if err != nil {
+		c.err = err.Error()
+		h.logger.Printf("%s public through %d of %d addresses after %s: %v", rec.ID, reached, of, c.took, err)
+	}
+}
+
+func (s *live) stopCheck() {
+	if s.check != nil {
+		s.check.cancel()
+		s.check = nil
+	}
+}
+
+// notify tells the desktop how a public check the CLI stopped waiting for
+// ended. A missing notifier is not an error: pagir ls shows the same.
+func notify(rec *record.Share, c publicCheck) {
+	name := filepath.Base(rec.Path)
+	var body string
+	switch {
+	case c.err == "":
+		body = fmt.Sprintf("%s now answers through all %d public addresses\n%s", name, c.of, rec.URL)
+	case c.of == 0:
+		body = fmt.Sprintf("%s is on your tailnet but not public: %s; pagir doctor may say why\n%s", name, c.err, rec.URL)
+	default:
+		body = fmt.Sprintf("%s answers through %d of %d public addresses after %s; pagir doctor may say why\n%s", name, c.reached, c.of, c.took, rec.URL)
+	}
+	platform.Notify("pagir", body)
 }
 
 func lane0(public bool) int {
@@ -261,12 +361,15 @@ func (h *hub) tend(ctx context.Context, l *lane, need bool) {
 		cmd := tailnet.MountCommand(l.public, l.https, l.target())
 		w := io.MultiWriter(l.out, prefixWriter{h.logger, "tailscale: "})
 		cmd.Stdout, cmd.Stderr = w, w
+		cmd.WaitDelay = 2 * time.Second // a grandchild holding the pipe must not block Wait
+		platform.TieToParent(cmd)
 		if err := cmd.Start(); err != nil {
 			l.fails = laneFailures // tailscale cannot even run; retrying will not help soon
 			l.err = fmt.Sprintf("start tailscale: %v", err)
 			h.logger.Print(l.err)
 			return
 		}
+		platform.AfterStart(cmd)
 		l.child, l.exited = cmd, make(chan error, 1)
 		go func() { l.exited <- cmd.Wait() }()
 	case !need:
@@ -313,11 +416,16 @@ func (h *hub) publish(want map[string]*record.Share) {
 		if !st.Ready && l.fails >= laneFailures {
 			st.Error = l.err
 		}
+		if s := h.byID[id]; s != nil && s.check != nil {
+			st.Reached, st.Of = s.check.reached, s.check.of
+			st.Public = s.check.done && s.check.err == "" && s.check.of > 0
+			st.PublicErr = s.check.err
+		}
 		hs.Shares[id] = st
 	}
 	h.mu.RUnlock()
 	data, _ := json.Marshal(hs)
-	if bytes.Equal(data, h.last) {
+	if bytes.Equal(data, h.last) && record.HubWritten() {
 		return
 	}
 	hs.Updated = time.Now()
@@ -344,15 +452,16 @@ func (h *hub) shutdown() {
 	}
 	h.mu.Lock()
 	for _, s := range h.byID {
+		s.stopCheck()
 		s.srv.Close()
 	}
 	h.mu.Unlock()
-	record.RemoveHub()
+	record.RemoveHub(os.Getpid())
 }
 
 // stopChild ends a tailscale CLI, which makes tailscaled drop its mount.
 func stopChild(cmd *exec.Cmd, exited chan error) {
-	cmd.Process.Signal(syscall.SIGTERM)
+	platform.Terminate(cmd.Process)
 	select {
 	case <-exited:
 	case <-time.After(5 * time.Second):

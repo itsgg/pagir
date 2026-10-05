@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 
+	"github.com/itsgg/pagir/internal/platform"
 	"github.com/itsgg/pagir/internal/record"
 	"github.com/itsgg/pagir/internal/tailnet"
 )
@@ -57,16 +59,23 @@ func cmdDoctor() bool {
 	}
 
 	me := currentUser()
-	if os.Geteuid() == 0 {
+	switch {
+	case runtime.GOOS != "linux":
+		// The operator is a Linux idea: elsewhere the CLI talks to the app
+		// as the signed-in user.
+	case os.Geteuid() == 0:
 		say("ok", "running as root")
-	} else if op, err := tailnet.Operator(ctx); err != nil {
-		say("warn", "cannot read the operator: %v", err)
-	} else if op == me {
-		say("ok", "%s is the tailscale operator, so no sudo is needed", me)
-	} else {
-		say("fail", "%s is not the tailscale operator: sudo tailscale set --operator=%s", me, me)
+	default:
+		if op, err := tailnet.Operator(ctx); err != nil {
+			say("warn", "cannot read the operator: %v", err)
+		} else if op == me {
+			say("ok", "%s is the tailscale operator, so no sudo is needed", me)
+		} else {
+			say("fail", "%s is not the tailscale operator: sudo tailscale set --operator=%s", me, me)
+		}
 	}
 
+	running := hubRunning()
 	if sc, err := tailnet.GetServeConfig(ctx); err != nil {
 		say("warn", "cannot read the serve config: %v", err)
 	} else {
@@ -80,7 +89,7 @@ func cmdDoctor() bool {
 			port   int
 			kind   string
 		}{{true, publicHTTPS, "public"}, {false, tailnetHTTPS, "tailnet-only"}} {
-			if f := sc.Foreign(fmt.Sprintf("%s:%d", host, l.port), hubTarget(ctx, l.public)); len(f) > 0 {
+			if f := sc.Foreign(fmt.Sprintf("%s:%d", host, l.port), hubTarget(l.public)); len(f) > 0 {
 				say("fail", "port %d is taken by %s, so pagir cannot publish %s shares until it stops", l.port, strings.Join(f, ", "), l.kind)
 			} else {
 				say("ok", "port %d is free for %s shares", l.port, l.kind)
@@ -88,8 +97,9 @@ func cmdDoctor() bool {
 		}
 	}
 
-	if h, err := record.LoadHub(); err == nil && hubRunning(ctx, h) {
-		say("ok", "the hub is running with %d share(s)", len(h.Shares))
+	if running {
+		h, _ := record.LoadHub()
+		say("ok", "the hub is running with %d share(s) and holds port %d for Funnel; pagir stop hub frees it", len(h.Shares), publicHTTPS)
 	} else {
 		say("ok", "the hub is not running; it starts with the first share")
 	}
@@ -101,24 +111,25 @@ func cmdDoctor() bool {
 			"Tailscale publishes it while a funnel is on, which can take minutes the first time", host)
 	}
 
-	if out, _ := exec.CommandContext(ctx, "systemctl", "--user", "is-system-running").Output(); len(out) > 0 {
-		state := strings.TrimSpace(string(out))
-		if state == "running" || state == "degraded" {
-			say("ok", "systemd user manager is %s", state)
-		} else {
-			say("fail", "systemd user manager is %s: background shares need it", state)
-		}
+	if dir, err := record.Dir(); err != nil {
+		say("fail", "no state directory: %v", err)
 	} else {
-		say("fail", "no systemd user manager: only pagir -f works")
+		say("ok", "state in %s", tilde(dir))
 	}
+	say("ok", "tailscale CLI at %s", platform.Tailscale())
 
-	switch clip := clipboardTool(); {
+	switch clip := platform.Clipboard(); {
 	case clip == "":
-		say("ok", "no graphical session, so URLs are printed, not copied")
+		say("ok", "no clipboard in this session, so URLs are printed, not copied")
 	case lookPath(clip):
 		say("ok", "URLs are copied with %s", clip)
 	default:
 		say("warn", "%s is missing, so URLs are not copied", clip)
 	}
 	return ok
+}
+
+func lookPath(bin string) bool {
+	_, err := exec.LookPath(bin)
+	return err == nil
 }

@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"os"
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/itsgg/pagir/internal/record"
 )
 
 func TestParseLifetime(t *testing.T) {
@@ -41,5 +45,51 @@ func TestFmtLeft(t *testing.T) {
 		if got := fmtLeft(d); got != want {
 			t.Errorf("%v: %q, want %q", d, got, want)
 		}
+	}
+}
+
+func TestTailLog(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	p, err := record.Path("hub.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(d time.Duration, msg string) string {
+		return time.Now().Add(d).Format(logStamp) + " " + msg + "\n"
+	}
+	os.WriteFile(p+".1", []byte(at(-time.Hour, "aaaaaa old line")+at(-10*time.Second, "aaaaaa rotated")), 0o600)
+	os.WriteFile(p, []byte(at(-5*time.Second, "bbbbbb other share")+at(-4*time.Second, "aaaaaa GET /.../x 200")+"garbage\n"+at(-3*time.Second, "aaaaaab not this one")), 0o600)
+	var got []string
+	err = tailLog(context.Background(), "aaaaaa", time.Now().Add(-time.Minute), false, func(_ time.Time, msg string) {
+		got = append(got, msg)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"rotated", "GET /.../x 200"}; !slices.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestShareLoggerFeedsTailLog holds the hub's writer and the reader together.
+func TestShareLoggerFeedsTailLog(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	p, err := record.Path("hub.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shareLogger(f, "abc123").Printf("GET /.../x 200")
+	newLogger(f).Printf("abc123 expired")
+	f.Close()
+	var got []string
+	tailLog(context.Background(), "abc123", time.Now().Add(-time.Minute), false, func(_ time.Time, msg string) {
+		got = append(got, msg)
+	})
+	if want := []string{"GET /.../x 200", "expired"}; !slices.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }

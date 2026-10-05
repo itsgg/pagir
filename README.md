@@ -11,8 +11,9 @@ file ~/Videos/talk.mp4, public, ends Tue 6 Oct 14:30, id 810d75, copied
 ```
 
 The link works for anyone, ends after 24 hours unless you say otherwise,
-and is already on your clipboard. The path segment is 128 random bits, so
-only people you give the link to can find it.
+and is already on your clipboard. "public" means pagir fetched it through
+every public Funnel address before saying so. The path segment is 128
+random bits, so only people you give the link to can find it.
 
 ## Use
 
@@ -27,6 +28,7 @@ pagir -H DIR             include dotfiles, which are hidden by default
 pagir -q PATH            print a QR code too
 pagir ls                 list active shares
 pagir stop ID... | all   take shares down
+pagir stop hub           take everything down and free port 443
 pagir log [-f] ID        who fetched what
 pagir doctor             check everything a working link needs
 ```
@@ -42,10 +44,10 @@ seeking and big downloads can resume, since range requests work.
 go install github.com/itsgg/pagir@latest
 ```
 
-or `make install`, which builds into `~/.local/bin`. pagir needs Linux with
-systemd, and Tailscale with MagicDNS, HTTPS certificates and the Funnel
-node attribute enabled for the machine. Make your user the Tailscale
-operator once, so pagir needs no sudo:
+or `make install`, which builds into `~/.local/bin`. pagir runs on Linux,
+macOS and Windows, and needs Tailscale with MagicDNS, HTTPS certificates
+and the Funnel node attribute enabled for the machine. On Linux, make your
+user the Tailscale operator once, so pagir needs no sudo:
 
 ```
 sudo tailscale set --operator=$USER
@@ -54,20 +56,26 @@ sudo tailscale set --operator=$USER
 `pagir doctor` checks all of that, plus whether the machine's name resolves
 in public DNS, which Tailscale publishes only after the first funnel.
 
+CI builds and tests pagir on all three systems. The live tests, which open
+real funnels, have run on Linux only so far.
+
 ## How it works
 
-One small process, the hub, runs as a systemd user unit while anything is
-shared. It owns port 443 through a foreground `tailscale funnel` (8443
-through `tailscale serve` for tailnet-only shares), proxies to its own
-localhost listeners, and routes each request by its token. It starts with
-the first share and exits after the last. If it is killed, tailscaled drops
-its mounts with it, so nothing stays published. Files are read as your user
-and confined to the shared folder, symlinks included.
+The first share starts a small background process, the hub. It owns port
+443 through one foreground `tailscale funnel` (8443 through `tailscale
+serve` for tailnet-only shares), proxies to its own localhost listeners,
+and routes each request by its token. It keeps the funnel up after the last
+share, because Tailscale's ingress nodes take up to two minutes to relearn
+a funnel that was off; `pagir stop hub` ends it. If it is killed, its
+tailscale processes go with it, so nothing stays published, and a crash
+restarts it. Files are read as your user and confined to the shared
+folder, symlinks included.
 
-Before saying a share is public, pagir fetches it through every public
-Funnel address, because Tailscale's ingress nodes can take a while to learn
-about a new funnel. [docs/DESIGN.md](docs/DESIGN.md) has the reasons behind
-each choice.
+A new share is called public only once every public Funnel address
+answers. When that takes longer than a few seconds, the first share after
+a reboot, pagir says how many answered so far and sends a desktop
+notification when the rest do. [docs/DESIGN.md](docs/DESIGN.md) has the
+reasons behind each choice.
 
 ## Develop
 

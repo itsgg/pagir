@@ -28,36 +28,41 @@ as a zip, and takes uploads when `-u` is on; `curl -T file URL` uploads too.
 
 ## How it runs
 
-Three kinds of state, each with one writer:
+State lives in `$XDG_STATE_HOME/pagir` (`~/.local/state/pagir` by default),
+each file with one writer:
 
-- `$XDG_STATE_HOME/pagir/<id>.json`, one per share, written only by the
-  CLI. Creating the file starts a share; deleting it stops one.
+- `<id>.json`, one per share, written only by the CLI. Creating the file
+  starts a share; deleting it stops one. A foreground share's terminal
+  touches it every two seconds.
 - `hub.json`, written only by the hub: its pid, its local ports, and each
-  share's status (ready, or why not).
+  share's status (ready, how many public addresses answer, or why not).
+- `hub.lock`, held by the supervisor while a hub runs; `hub.log`, the hub's
+  log; `hub.stop`, left by `pagir stop hub` to end it; `<id>.notify`, left
+  by the CLI to ask for a notification.
 - tailscaled's serve config, changed only by the hub's tailscale children.
 
-The hub is `pagir hub`, run as the transient user unit `pagir.service`. The
-CLI starts it when it writes a record and finds no hub. Once a second, the
-hub lists the records and makes its routing table match them: it drops a
-record that expired, that was made before the last reboot, or whose
-foreground owner has died; it opens each new share as a `web.Server`; it
-closes shares whose record has gone. It holds two local listeners, one per
-lane:
+`pagir PATH` writes the record and, if no supervisor holds `hub.lock`,
+starts one detached: `pagir hub`. The supervisor runs the hub itself
+(`pagir hub --child`) and restarts it after a crash. Once a second, the hub
+lists the records and makes its routing table match them: it drops a
+record that expired, that was made before the last boot, or whose
+foreground terminal stopped touching it ten seconds ago; it opens each new
+share as a `web.Server`; it closes shares whose record has gone. It holds
+two local listeners, one per lane:
 
-| lane    | tailscale child                         | serves                  |
-|---------|-----------------------------------------|-------------------------|
-| public  | `tailscale funnel --https=443 <local>`  | shares without `-t`     |
-| tailnet | `tailscale serve --https=8443 <local>`  | shares with `-t`        |
+| lane    | tailscale child                         | serves                  | runs                  |
+|---------|-----------------------------------------|-------------------------|-----------------------|
+| public  | `tailscale funnel --https=443 <local>`  | shares without `-t`     | while the hub runs    |
+| tailnet | `tailscale serve --https=8443 <local>`  | shares with `-t`        | while it has a share  |
 
-A child runs only while its lane has a share. Each request is routed by
-the token in its first path segment, and only on its own lane, so a
-tailnet-only token gets a 404 through Funnel. When no record has been
-wanted for 10 seconds the hub exits.
+Each request is routed by the token in its first path segment, and only
+on its own lane, so a tailnet-only token gets a 404 through Funnel.
 
-`pagir PATH` writes the record, makes sure the hub runs, waits for
-`hub.json` to say the share is ready, and then for a public share waits
-until the URL answers through every public Funnel address before it says
-"public".
+Once a public share's lane is mounted, the hub checks it through every
+public Funnel address, for up to five minutes. The CLI waits up to eight
+seconds for that check. If it ends in time the CLI says "public"; if not,
+it says how many addresses answered so far, leaves `<id>.notify`, and
+returns, and the hub sends a desktop notification when the check ends.
 
 ## Decisions
 
@@ -66,39 +71,70 @@ listener.** The first design ran one process per share, each with its own
 foreground `tailscale funnel --set-path /<token>`. The second share failed
 with `listener already exists for port 443`. Funnel offers three ports, so
 per-share listeners cap out at three shares. The hub owns the port once and
-routes by token instead. It is a daemon only while something is shared: it
-starts with the first share and exits after the last, so nothing listens
-on 443 while nothing is shared.
+routes by token instead.
+
+**The funnel stays up after the last share.** The first hub exited ten
+seconds after the last share, so the next share started the funnel cold.
+Funnel's ingress nodes then take their time: one share waited 45 seconds
+and still answered through only three of four addresses, the last
+answering between 46 and 110 seconds after the funnel came up. A share on
+a funnel already up was public through all four addresses in 1.6 seconds.
+The cost is that no other funnel can use port 443 while pagir's hub runs;
+`pagir stop hub` frees it.
+
+**pagir supervises itself instead of using systemd.** The hub first ran as
+a transient systemd user unit, which gave restarts and a journal for free
+and tied pagir to Linux. A detached supervisor gives the same on every
+system: an exclusive lock on `hub.lock` both keeps a second hub out and
+tells the CLI whether one runs, and the lock goes when the process does,
+however it ends. Logs go to `hub.log`, which `pagir log` reads.
 
 **Foreground tailscale children, never `--bg`.** tailscaled ties a
 foreground mount to the CLI's connection and removes it when that
-connection closes. If the hub is killed outright, its children die with it
-(Pdeathsig) and the mounts go. Kill the machine's power and the mounts are
-still gone after boot. A `--bg` mount outlives its owner, survives reboots
-in tailscaled's prefs, and would need cleanup code that can itself fail.
+connection closes, so a mount lives exactly as long as the child holding
+it. The children die with the hub: Pdeathsig on Linux, a kill-on-close job
+object on Windows, and on macOS, which has neither, the supervisor kills
+the dead hub's process group. A `--bg` mount outlives its owner, survives
+reboots in tailscaled's prefs, and would need cleanup code that can itself
+fail.
 
 **One writer per file.** The hub never writes a share record, only deletes
 one. If it wrote readiness into the record, a `pagir stop` that deleted
 the file just before the hub's write would see the share come back. Status
 lives in `hub.json`, which only the hub writes.
 
-**Polling, not signals.** The CLI could poke the hub with SIGHUP, but a
+**Files, not signals.** The CLI could poke the hub with a signal, but a
 hub that has just started, before it installs its handler, would die of
-it. Listing a few small files once a second costs nothing, and `stop`
-waits until `hub.json` drops the share, so it returns when the share is
-really gone.
+it, and Windows has no SIGHUP or SIGTERM to send. Listing a few small
+files once a second costs nothing. `stop` waits until `hub.json` drops the
+share, so it returns when the share is really gone; `stop hub` leaves
+`hub.stop` and waits for the lock to go.
 
-**Records die with the boot.** Each record carries the kernel's boot id.
-Shares are running things: after a reboot no hub runs, and the next share
-would otherwise start a hub that silently republishes every old record.
+**Records die with the boot.** A record made before the machine last
+booted is dropped, by comparing its creation time with the boot time
+(`/proc/stat` on Linux, `kern.boottime` on macOS, the tick count on
+Windows). Shares are running things: after a reboot no hub runs, and the
+next share would otherwise start a hub that silently republishes every old
+record.
+
+**A foreground share is a file its terminal touches.** Checking the
+terminal's pid would need /proc to rule out a reused pid. A modification
+time older than ten seconds means the terminal is gone, on any system.
 
 **Public means every Funnel address answers.** After a funnel starts, each
 ingress node learns of it on its own schedule; for tens of seconds one of
 the host's public addresses answered while another dropped the TLS
-handshake. pagir probes each address from public DNS (asked of 1.1.1.1
-directly, since the local resolver answers from MagicDNS) and reports how
-many answered. An address this machine cannot route to, such as IPv6
-without IPv6, is left out.
+handshake. The hub probes each address from public DNS (asked of 1.1.1.1
+directly, since the local resolver answers from MagicDNS), and a share is
+"public" only when all answer. An address this machine cannot route to,
+such as IPv6 without IPv6, is left out. Its probes carry the User-Agent
+`pagir-probe` and stay out of the access log.
+
+**Say what was checked, and no more.** The first version waited 45
+seconds, then printed the raw Go error and "the rest usually follow within
+a minute", which was a guess. Now the CLI waits eight seconds, states how
+many addresses answered, and the notification reports the outcome when it
+is known.
 
 **The tailscale CLI, not the Go client library.** The library would let the
 hub set the serve config itself, but the config is read, modified and

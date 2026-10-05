@@ -33,15 +33,7 @@ type Share struct {
 	URL        string    `json:"url"`
 	Created    time.Time `json:"created"`
 	Expires    time.Time `json:"expires,omitzero"`
-	Foreground bool      `json:"foreground,omitempty"`
-	Owner      int       `json:"owner,omitempty"` // pid of the attached CLI of a foreground share
-	Boot       string    `json:"boot"`            // the boot it was made in; a share never outlives a reboot
-}
-
-// CurrentBoot is the kernel's id for this boot.
-func CurrentBoot() string {
-	b, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
-	return strings.TrimSpace(string(b))
+	Foreground bool      `json:"foreground,omitempty"` // its terminal touches the file; see Touch
 }
 
 // Expired reports whether the share's lifetime is over at now.
@@ -214,16 +206,42 @@ func Remove(id string) error {
 	if err != nil {
 		return err
 	}
+	os.Remove(strings.TrimSuffix(file, ".json") + ".notify")
 	if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
 }
 
-// Status is the hub's view of one share.
+// Status is the hub's view of one share. For a public share, Reached of Of
+// public Funnel addresses have answered so far; Public means all of them.
 type Status struct {
-	Ready bool   `json:"ready,omitempty"`
-	Error string `json:"error,omitempty"`
+	Ready     bool   `json:"ready,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Reached   int    `json:"reached,omitempty"`
+	Of        int    `json:"of,omitempty"`
+	Public    bool   `json:"public,omitempty"`
+	PublicErr string `json:"public_error,omitempty"`
+}
+
+// MarkNotify asks the hub for a desktop notification when the share's public
+// check ends. The CLI leaves it when it stops waiting before the check does.
+func MarkNotify(id string) error {
+	file, err := File(id)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(strings.TrimSuffix(file, ".json")+".notify", nil, 0o600)
+}
+
+// TakeNotify removes the mark and reports whether there was one; the hub
+// calls it, so a notification goes out once.
+func TakeNotify(id string) bool {
+	file, err := File(id)
+	if err != nil {
+		return false
+	}
+	return os.Remove(strings.TrimSuffix(file, ".json")+".notify") == nil
 }
 
 // Hub is what the hub publishes about itself: its local ports, which tell
@@ -273,9 +291,55 @@ func LoadHub() (*Hub, error) {
 	return &h, nil
 }
 
-// RemoveHub deletes hub.json when the hub exits.
-func RemoveHub() {
-	if file, err := hubFile(); err == nil {
-		os.Remove(file)
+// Touch marks a foreground share's terminal as still attached.
+func Touch(id string) error {
+	file, err := File(id)
+	if err != nil {
+		return err
 	}
+	now := time.Now()
+	return os.Chtimes(file, now, now)
+}
+
+// Age is how long since the record was written or touched.
+func Age(id string) time.Duration {
+	file, err := File(id)
+	if err != nil {
+		return 0
+	}
+	fi, err := os.Stat(file)
+	if err != nil {
+		return 0
+	}
+	return time.Since(fi.ModTime())
+}
+
+// Path names a file of the hub's in the state directory: hub.lock, held
+// while a hub runs; hub.log; hub.stop, which asks it to end.
+func Path(name string) (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, name), nil
+}
+
+// RemoveHub deletes hub.json if the hub with this pid wrote it, so a hub
+// that outlived its supervisor cannot delete its successor's.
+func RemoveHub(pid int) {
+	if h, err := LoadHub(); err == nil && h.PID == pid {
+		if file, err := hubFile(); err == nil {
+			os.Remove(file)
+		}
+	}
+}
+
+// HubWritten reports whether hub.json exists.
+func HubWritten() bool {
+	file, err := hubFile()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(file)
+	return err == nil
 }

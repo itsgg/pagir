@@ -7,11 +7,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"os/user"
 	"path/filepath"
@@ -21,10 +19,10 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/itsgg/pagir/internal/platform"
 	"github.com/itsgg/pagir/internal/qr"
 	"github.com/itsgg/pagir/internal/record"
 	"github.com/itsgg/pagir/internal/tailnet"
-	"github.com/itsgg/pagir/internal/unit"
 )
 
 const usage = `pagir puts a file or folder on the internet through Tailscale Funnel.
@@ -33,6 +31,7 @@ Usage:
   pagir [flags] PATH       share PATH; in the background for 24h by default
   pagir ls                 list active shares
   pagir stop ID... | all   take shares down
+  pagir stop hub           take every share and the hub down, freeing port 443
   pagir log [-f] ID        show one share's access log
   pagir doctor             check everything a working link needs
 
@@ -48,7 +47,7 @@ Flags:
 
 const (
 	defaultLifetime = 24 * time.Hour
-	publicWait      = 45 * time.Second
+	announceWait    = 8 * time.Second // how long a new share waits for the public check before handing it to the hub
 )
 
 func main() {
@@ -76,7 +75,11 @@ func main() {
 		}
 		return
 	case "hub":
-		cmdHub()
+		if len(args) > 1 && args[1] == "--child" {
+			cmdHub()
+		} else {
+			cmdSupervise()
+		}
 		return
 	default:
 		err = cmdShare(args)
@@ -139,15 +142,15 @@ func cmdShare(args []string) error {
 	}
 
 	rec := &record.Share{
-		Token:    record.NewToken(),
-		Path:     abs,
-		Dir:      fi.IsDir(),
-		Public:   !tailnetOnly,
-		Upload:   upload,
-		Hidden:   hidden,
-		Password: password,
-		Created:  time.Now(),
-		Boot:     record.CurrentBoot(),
+		Token:      record.NewToken(),
+		Path:       abs,
+		Dir:        fi.IsDir(),
+		Public:     !tailnetOnly,
+		Upload:     upload,
+		Hidden:     hidden,
+		Password:   password,
+		Created:    time.Now(),
+		Foreground: fg,
 	}
 	rec.URL = "https://" + host
 	if tailnetOnly {
@@ -160,15 +163,15 @@ func cmdShare(args []string) error {
 	if !never {
 		rec.Expires = rec.Created.Add(lifetime).Round(time.Second)
 	}
-	if fg {
-		rec.Foreground, rec.Owner = true, os.Getpid()
-	}
 
 	if err := record.Create(rec); err != nil {
 		return err
 	}
 	id := rec.ID
-	if err := ensureHub(ctx); err != nil {
+	if fg {
+		go attached(ctx, id)
+	}
+	if err := ensureHub(); err != nil {
 		record.Remove(id)
 		return err
 	}
@@ -176,14 +179,29 @@ func cmdShare(args []string) error {
 		record.Remove(id)
 		return err
 	}
-	announce(ctx, host, rec, showQR)
+	public := announce(ctx, rec, showQR)
 	if !fg {
 		return nil
 	}
-	follow(ctx, rec)
+	follow(ctx, rec, public)
 	record.Remove(id)
 	waitGone(id)
 	return nil
+}
+
+// attached touches a foreground share's record while its terminal lives;
+// the hub ends a share whose record has gone untouched for attachedFor.
+func attached(ctx context.Context, id string) {
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			record.Touch(id)
+		}
+	}
 }
 
 // preflight returns this node's host name, or the reason a share cannot work.
@@ -217,7 +235,7 @@ func preflight(ctx context.Context, public bool) (string, error) {
 	if public {
 		port = publicHTTPS
 	}
-	if f := sc.Foreign(fmt.Sprintf("%s:%d", st.Host(), port), hubTarget(ctx, public)); len(f) > 0 {
+	if f := sc.Foreign(fmt.Sprintf("%s:%d", st.Host(), port), hubTarget(public)); len(f) > 0 {
 		return "", fmt.Errorf("port %d is taken by %s; tailscaled gives a whole port to one listener, so stop that first", port, strings.Join(f, ", "))
 	}
 	return st.Host(), nil
@@ -225,9 +243,12 @@ func preflight(ctx context.Context, public bool) (string, error) {
 
 // hubTarget is the local address the running hub proxies a lane to, or ""
 // when no hub runs, so every listener counts as someone else's.
-func hubTarget(ctx context.Context, public bool) string {
+func hubTarget(public bool) string {
+	if !hubRunning() {
+		return ""
+	}
 	h, err := record.LoadHub()
-	if err != nil || !hubRunning(ctx, h) {
+	if err != nil {
 		return ""
 	}
 	port := h.TailnetPort
@@ -240,59 +261,20 @@ func hubTarget(ctx context.Context, public bool) string {
 	return fmt.Sprintf("http://127.0.0.1:%d", port)
 }
 
-func hubActive(ctx context.Context) bool {
-	up, _ := hubUp(ctx)
-	return up
-}
-
-// hubRunning answers from systemd when it can be asked, and otherwise from
-// whether the pid hub.json names is a live pagir, so a shell without the
-// user bus does not mistake the hub's own mount for someone else's.
-func hubRunning(ctx context.Context, h *record.Hub) bool {
-	if up, known := hubUp(ctx); known {
-		return up
-	}
-	return h != nil && processIsPagir(h.PID)
-}
-
-// hubUp reports whether the hub runs, and whether systemd could be asked at
-// all; a shell without the user bus must not read as "no hub".
-func hubUp(ctx context.Context) (up, known bool) {
-	active, _, err := unit.State(ctx, hubUnit)
-	if err != nil {
-		return false, false
-	}
-	return active == "active" || active == "activating" || active == "reloading", true
-}
-
-// ensureHub starts the hub unless it runs. Two pagirs racing to start it is
-// fine: the loser finds it running.
-func ensureHub(ctx context.Context) error {
-	if hubActive(ctx) {
+// ensureHub starts the hub unless one runs. Two pagirs racing to start it
+// is fine: the second supervisor finds the lock taken and leaves.
+func ensureHub() error {
+	if hubRunning() {
 		return nil
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	dir, err := record.Dir()
-	if err != nil {
-		return err
-	}
-	// The hub gets systemd's environment, not this shell's, so it is told
-	// where the records are.
-	env := []string{"XDG_STATE_HOME=" + filepath.Dir(dir)}
-	if err := unit.Start(ctx, hubUnit, "pagir: shares files through Tailscale", env, []string{exe, "hub"}); err != nil && !hubActive(ctx) {
-		return err
-	}
-	return nil
+	return startHub()
 }
 
-// waitReady waits until the hub reports the share live, restarting a hub
-// that exited for want of shares just before this one was written.
+// waitReady waits until the hub reports the share live, starting the hub
+// again if it is not running a moment after it should be.
 func waitReady(ctx context.Context, id string) error {
 	deadline := time.Now().Add(mountWait + 15*time.Second)
-	restarts := 0
+	starts, down := 0, 0
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -309,26 +291,30 @@ func waitReady(ctx context.Context, id string) error {
 				}
 			}
 		}
-		if !hubActive(ctx) {
-			if restarts == 3 {
-				return fmt.Errorf("the hub keeps stopping:\n%s", unit.Journal(ctx, hubUnit, 15))
-			}
-			restarts++
-			if err := ensureHub(ctx); err != nil {
-				return err
-			}
+		if hubRunning() {
+			down = 0
+			continue
+		}
+		if down++; down < 5 { // a supervisor takes a moment to lock
+			continue
+		}
+		if starts == 3 {
+			return fmt.Errorf("the hub keeps stopping; the end of its log:\n%s", logTail(15))
+		}
+		starts, down = starts+1, 0
+		if err := startHub(); err != nil {
+			return err
 		}
 	}
-	return fmt.Errorf("the share did not come up:\n%s", unit.Journal(ctx, hubUnit, 15))
+	return fmt.Errorf("the share did not come up; the end of the hub's log:\n%s", logTail(15))
 }
 
 // waitGone waits briefly until the hub has dropped the ids, so a stopped
 // share is really gone when the command returns.
 func waitGone(ids ...string) {
-	ctx := context.Background()
 	for range 30 {
 		h, err := record.LoadHub()
-		if err != nil || !hubActive(ctx) {
+		if err != nil || !hubRunning() {
 			return
 		}
 		left := false
@@ -344,38 +330,49 @@ func waitGone(ids ...string) {
 	}
 }
 
-// announce prints the URL, copies it, and for a public share waits until the
-// link answers through Funnel's public ingress, which can lag the local mount
-// by several seconds when no other funnel was on.
-func announce(ctx context.Context, host string, rec *record.Share, showQR bool) {
+// announce prints the URL and one line of facts, every one of them checked.
+// For a public share it waits a few seconds for the hub's check of every
+// public address; if that is not done, it says how far it got and leaves a
+// mark so the hub sends a notification when the check ends.
+// It returns whether the public check is over, so a foreground share does
+// not report it twice.
+func announce(ctx context.Context, rec *record.Share, showQR bool) (checked bool) {
 	fmt.Println(rec.URL)
 	if showQR {
 		if code, err := qr.Render(rec.URL); err == nil {
 			fmt.Print(code)
 		}
 	}
-	copied := copyToClipboard(rec.URL)
+	copied := platform.Copy(rec.URL)
 	kind := "file"
 	if rec.Dir {
 		kind = "folder"
 	}
 	facts := []string{kind + " " + tilde(rec.Path)}
-	var warning string
+	var later string
+	checked = true
 	if rec.Public {
-		slow := time.AfterFunc(2*time.Second, func() {
-			fmt.Fprintln(os.Stderr, "checking the link from every public address; the first share after a quiet spell takes a while...")
-		})
-		answered, tried, err := tailnet.WaitPublic(ctx, host, rec.URL, publicWait)
-		slow.Stop()
+		st := waitPublic(ctx, rec.ID)
 		switch {
-		case err == nil:
+		case st.Public:
 			facts = append(facts, "public")
-		case answered > 0:
-			facts = append(facts, fmt.Sprintf("public through %d of %d Funnel addresses", answered, tried))
-			warning = fmt.Sprintf("warning: some visitors may not reach it yet (%v); the rest usually follow within a minute", err)
+		case st.PublicErr != "" && st.Reached == 0:
+			facts = append(facts, "tailnet only for now")
+			later = "not public yet: " + st.PublicErr
+		case st.PublicErr != "":
+			facts = append(facts, fmt.Sprintf("public through %d of %d addresses", st.Reached, st.Of))
+			later = "some visitors cannot reach it: " + st.PublicErr
 		default:
-			facts = append(facts, "public, NOT reachable yet")
-			warning = fmt.Sprintf("warning: the link works on your tailnet but not yet from the internet (%v); pagir doctor says why", err)
+			checked = false
+			if rec.Foreground {
+				later = fmt.Sprintf("public through %d of %d addresses so far; this terminal says when all answer", st.Reached, st.Of)
+			} else {
+				record.MarkNotify(rec.ID)
+				later = fmt.Sprintf("public through %d of %d addresses so far; a notification follows when all answer", st.Reached, st.Of)
+			}
+			if st.Of == 0 {
+				later = strings.Replace(later, "public through 0 of 0 addresses so far", "public addresses not checked yet", 1)
+			}
 		}
 	} else {
 		facts = append(facts, "tailnet only")
@@ -397,30 +394,47 @@ func announce(ctx context.Context, host string, rec *record.Share, showQR bool) 
 		facts = append(facts, "copied")
 	}
 	fmt.Fprintln(os.Stderr, strings.Join(facts, ", "))
-	if warning != "" {
-		fmt.Fprintln(os.Stderr, warning)
+	if later != "" {
+		fmt.Fprintln(os.Stderr, later)
 	}
+	return checked
+}
+
+// waitPublic follows the hub's check of a share's public addresses for up
+// to announceWait and returns how far it got.
+func waitPublic(ctx context.Context, id string) record.Status {
+	var st record.Status
+	deadline := time.Now().Add(announceWait)
+	for time.Now().Before(deadline) {
+		if h, err := record.LoadHub(); err == nil {
+			st = h.Shares[id]
+			if st.Public || (st.PublicErr != "" && st.Reached == 0) {
+				return st
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return st
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return st
 }
 
 // follow prints a foreground share's requests until Ctrl+C, or until the
 // share ends some other way (expiry, pagir stop). It reads from the share's
-// creation, so requests made while announce probed the public side show too.
-func follow(ctx context.Context, rec *record.Share) {
+// creation, so requests made while announce waited show too.
+func follow(ctx context.Context, rec *record.Share, checked bool) {
 	fmt.Fprintln(os.Stderr, "Ctrl+C to stop. Requests:")
 	lines := make(chan string)
-	jctx, cancel := context.WithCancel(ctx)
+	fctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := exec.CommandContext(jctx, "journalctl", journalArgs(rec.Created, true)...)
-	if out, err := cmd.StdoutPipe(); err == nil && cmd.Start() == nil {
-		go shareLines(out, rec.ID, func(stamp time.Time, msg string) {
-			select {
-			case lines <- stamp.Format("15:04:05") + " " + msg:
-			case <-jctx.Done():
-			}
-		})
-		// cancel first, or Wait blocks on a journalctl that follows for ever
-		defer func() { cancel(); cmd.Wait() }()
-	}
+	go tailLog(fctx, rec.ID, rec.Created, true, func(stamp time.Time, msg string) {
+		select {
+		case lines <- stamp.Format("15:04:05") + " " + msg:
+		case <-fctx.Done():
+		}
+	})
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -434,71 +448,52 @@ func follow(ctx context.Context, rec *record.Share) {
 				fmt.Fprintln(os.Stderr, "the share ended")
 				return
 			}
+			if !checked {
+				h, err := record.LoadHub()
+				if err != nil {
+					continue
+				}
+				st := h.Shares[rec.ID]
+				switch {
+				case st.Public:
+					checked = true
+					fmt.Fprintf(os.Stderr, "%s public through all %d addresses\n", time.Now().Format("15:04:05"), st.Of)
+				case st.PublicErr != "":
+					checked = true
+					fmt.Fprintf(os.Stderr, "%s public through %d of %d addresses; the check ended: %s\n", time.Now().Format("15:04:05"), st.Reached, st.Of, st.PublicErr)
+				}
+			}
 		}
-	}
-}
-
-func journalArgs(since time.Time, follow bool) []string {
-	argv := []string{"--user", "--unit=" + hubUnit, "--no-pager", "--output=short-iso-precise"}
-	if !since.IsZero() {
-		argv = append(argv, "--since="+since.Add(-time.Second).Format("2006-01-02 15:04:05"))
-	}
-	if follow {
-		argv = append(argv, "--follow")
-	}
-	return argv
-}
-
-// shareLines calls fn for each journal line the hub wrote about share id,
-// which it prefixes with the id.
-func shareLines(r io.Reader, id string, fn func(stamp time.Time, msg string)) {
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		head, msg, ok := strings.Cut(sc.Text(), "]: ")
-		if !ok {
-			continue
-		}
-		rest, ok := strings.CutPrefix(msg, id+" ")
-		if !ok {
-			continue
-		}
-		field, _, _ := strings.Cut(head, " ")
-		stamp, err := time.Parse("2006-01-02T15:04:05.999999-07:00", field)
-		if err != nil {
-			stamp = time.Now()
-		}
-		fn(stamp.Local(), rest)
 	}
 }
 
 func cmdList() error {
-	ctx := context.Background()
 	recs, err := record.List()
 	if err != nil {
 		return err
 	}
 	h, _ := record.LoadHub()
-	active, known := hubUp(ctx)
-	if !known {
-		log.Print("warning: cannot ask systemd about the hub, so states are unknown")
-	}
-	boot := record.CurrentBoot()
+	running := hubRunning()
+	boot, knowBoot := platform.BootTime()
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	n := 0
 	for _, rec := range recs {
-		if rec.Boot != boot || (known && !active && time.Since(rec.Created) > 15*time.Second) {
+		if (knowBoot && rec.Created.Before(boot.Add(-bootSlack))) || (!running && time.Since(rec.Created) > 15*time.Second) {
 			record.Remove(rec.ID) // nothing serves it any more
 			continue
 		}
 		state := "starting"
-		if !known {
-			state = "unknown"
-		} else if st, ok := h.Shares[rec.ID]; ok && active {
+		if st, ok := h.Shares[rec.ID]; ok && running {
 			switch {
-			case st.Ready:
-				state = "live"
 			case st.Error != "":
 				state = "failing"
+			case !st.Ready:
+			case !rec.Public || st.Public:
+				state = "live"
+			case st.Of > 0:
+				state = fmt.Sprintf("live, public %d/%d", st.Reached, st.Of)
+			default:
+				state = "live, checking public"
 			}
 		}
 		left := "never"
@@ -523,9 +518,13 @@ func cmdList() error {
 
 func cmdStop(args []string) error {
 	if len(args) == 0 {
-		return errors.New("stop which share? pagir stop ID... or pagir stop all")
+		return errors.New("stop which share? pagir stop ID..., pagir stop all, or pagir stop hub")
+	}
+	if len(args) == 1 && args[0] == "hub" {
+		return stopHub()
 	}
 	var recs []*record.Share
+	var missing []string
 	if len(args) == 1 && args[0] == "all" {
 		all, err := record.List()
 		if err != nil {
@@ -533,10 +532,12 @@ func cmdStop(args []string) error {
 		}
 		recs = all
 	} else {
+		// One id that is already gone does not keep the rest running.
 		for _, id := range args {
 			rec, err := record.Load(id)
 			if err != nil {
-				return err
+				missing = append(missing, id)
+				continue
 			}
 			recs = append(recs, rec)
 		}
@@ -552,10 +553,39 @@ func cmdStop(args []string) error {
 	for _, rec := range recs {
 		fmt.Fprintf(os.Stderr, "stopped %s (%s)\n", rec.ID, tilde(rec.Path))
 	}
+	if len(missing) > 0 {
+		return fmt.Errorf("no share %s", strings.Join(missing, ", "))
+	}
 	return nil
 }
 
-// cmdLog shows one share's lines from the hub's journal.
+// stopHub ends every share and the hub, which frees port 443.
+func stopHub() error {
+	recs, err := record.List()
+	if err != nil {
+		return err
+	}
+	for _, rec := range recs {
+		record.Remove(rec.ID)
+	}
+	if !hubRunning() {
+		fmt.Fprintln(os.Stderr, "no hub is running")
+		return nil
+	}
+	if err := askHubToStop(); err != nil {
+		return err
+	}
+	for range 200 {
+		if !hubRunning() {
+			fmt.Fprintf(os.Stderr, "stopped %d share(s) and the hub; port %d is free\n", len(recs), publicHTTPS)
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("the hub did not stop within 20s; the end of its log:\n%s", logTail(10))
+}
+
+// cmdLog shows one share's lines from hub.log.
 func cmdLog(args []string) error {
 	followFlag := false
 	var ids []string
@@ -577,18 +607,104 @@ func cmdLog(args []string) error {
 	if rec, err := record.Load(id); err == nil {
 		since = rec.Created
 	}
-	cmd := exec.Command("journalctl", journalArgs(since, followFlag)...)
-	out, err := cmd.StdoutPipe()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return tailLog(ctx, id, since, followFlag, func(stamp time.Time, msg string) {
+		fmt.Println(stamp.Format("2006-01-02 15:04:05"), msg)
+	})
+}
+
+// tailLog calls fn for each hub.log line about share id from since on,
+// oldest first, reading hub.log.1 before hub.log. With follow it keeps
+// reading new lines, across a rotation, until ctx ends.
+func tailLog(ctx context.Context, id string, since time.Time, follow bool, fn func(time.Time, string)) error {
+	p, err := record.Path("hub.log")
 	if err != nil {
 		return err
 	}
-	if err := cmd.Start(); err != nil {
-		return err
+	emit := func(line string) {
+		if len(line) <= len(logStamp) {
+			return
+		}
+		stamp, err := time.ParseInLocation(logStamp, line[:len(logStamp)], time.Local)
+		if err != nil || stamp.Before(since.Add(-time.Second)) {
+			return
+		}
+		if msg, ok := strings.CutPrefix(line[len(logStamp)+1:], id+" "); ok {
+			fn(stamp, msg)
+		}
 	}
-	shareLines(out, id, func(stamp time.Time, msg string) {
-		fmt.Println(stamp.Format("2006-01-02 15:04:05"), msg)
-	})
-	return cmd.Wait()
+	if old, err := os.Open(p + ".1"); err == nil {
+		sc := bufio.NewScanner(old)
+		for sc.Scan() {
+			emit(sc.Text())
+		}
+		old.Close()
+	}
+	f, err := os.Open(p)
+	if errors.Is(err, os.ErrNotExist) && !follow {
+		return nil
+	}
+	for err != nil {
+		if !follow {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(500 * time.Millisecond):
+		}
+		f, err = os.Open(p)
+	}
+	defer func() { f.Close() }()
+	r := bufio.NewReader(f)
+	var partial string
+	for {
+		chunk, err := r.ReadString('\n')
+		partial += chunk
+		if err == nil {
+			emit(strings.TrimRight(partial, "\r\n"))
+			partial = ""
+			continue
+		}
+		if !follow {
+			if partial != "" {
+				emit(partial)
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(300 * time.Millisecond):
+		}
+		// A new supervisor moves hub.log aside past logLimit: follow the new one.
+		if cur, err1 := f.Stat(); err1 == nil {
+			if now, err2 := os.Stat(p); err2 == nil && !os.SameFile(cur, now) {
+				if nf, err3 := os.Open(p); err3 == nil {
+					f.Close()
+					f, r, partial = nf, bufio.NewReader(nf), ""
+				}
+			}
+		}
+	}
+}
+
+// logTail is the last n lines of hub.log, for error messages.
+func logTail(n int) string {
+	p, err := record.Path("hub.log")
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return "(no hub.log)"
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // parseInterleaved lets flags come before or after the path, as people type
@@ -665,46 +781,6 @@ func tilde(p string) string {
 		}
 	}
 	return p
-}
-
-// processIsPagir guards against a recycled pid.
-func processIsPagir(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	return err == nil && strings.TrimSpace(string(comm)) == "pagir"
-}
-
-// clipboardTool is the copy command for this session, "" without one.
-func clipboardTool() string {
-	switch {
-	case os.Getenv("WAYLAND_DISPLAY") != "":
-		return "wl-copy"
-	case os.Getenv("DISPLAY") != "":
-		return "xclip"
-	}
-	return ""
-}
-
-func lookPath(bin string) bool {
-	_, err := exec.LookPath(bin)
-	return err == nil
-}
-
-// copyToClipboard reports whether the session's clipboard took text.
-func copyToClipboard(text string) bool {
-	var cmd *exec.Cmd
-	switch clipboardTool() {
-	case "wl-copy":
-		cmd = exec.Command("wl-copy")
-	case "xclip":
-		cmd = exec.Command("xclip", "-selection", "clipboard")
-	default:
-		return false
-	}
-	cmd.Stdin = strings.NewReader(text)
-	return cmd.Run() == nil
 }
 
 func currentUser() string {
