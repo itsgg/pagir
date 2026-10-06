@@ -1,14 +1,9 @@
 package platform
 
 import (
-	"bufio"
-	"errors"
 	"os"
 	"os/exec"
-	"strconv"
-	"strings"
 	"syscall"
-	"time"
 )
 
 var tailscaleFallbacks = []string{"/usr/bin/tailscale", "/usr/local/bin/tailscale"}
@@ -19,22 +14,6 @@ func TieToParent(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Pdeathsig = syscall.SIGTERM
-}
-
-func bootTime() (time.Time, error) {
-	f, err := os.Open("/proc/stat")
-	if err != nil {
-		return time.Time{}, err
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if rest, ok := strings.CutPrefix(sc.Text(), "btime "); ok {
-			n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
-			return time.Unix(n, 0), err
-		}
-	}
-	return time.Time{}, errors.New("no btime in /proc/stat")
 }
 
 func clipboard() []string {

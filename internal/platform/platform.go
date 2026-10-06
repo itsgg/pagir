@@ -1,13 +1,12 @@
 // Package platform holds what differs between Linux, macOS and Windows:
-// starting the hub detached, tying tailscale children to it, locking,
-// boot time, the clipboard, notifications and finding tailscale.
+// starting the hub detached, tying tailscale children to it, locking, the
+// clipboard, notifications and finding tailscale.
 package platform
 
 import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 )
 
 // Copy puts text on the clipboard and reports whether one took it.
@@ -41,11 +40,4 @@ func Tailscale() string {
 		}
 	}
 	return "tailscale"
-}
-
-// BootTime is when this machine last started; ok is false where it cannot
-// be read, and then nothing is judged by it.
-func BootTime() (t time.Time, ok bool) {
-	t, err := bootTime()
-	return t, err == nil && !t.IsZero()
 }

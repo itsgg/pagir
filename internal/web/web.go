@@ -228,12 +228,18 @@ func (s *Server) zip(w http.ResponseWriter, r *http.Request, name string) {
 	if name != "." {
 		base = path.Base(name)
 	}
+	fsys := s.root.FS()
+	// Fail while a status can still be sent: once the archive starts, an
+	// error can only cut the connection.
+	if _, err := fs.ReadDir(fsys, name); err != nil {
+		http.Error(w, "cannot read folder", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": base + ".zip"}))
 	if r.Method == http.MethodHead {
 		return
 	}
-	fsys := s.root.FS()
 	zw := zip.NewWriter(w)
 	zw.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
 		return flate.NewWriter(out, flate.BestSpeed)

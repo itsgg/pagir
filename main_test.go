@@ -93,3 +93,64 @@ func TestShareLoggerFeedsTailLog(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
+
+func TestPruneStale(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	mk := func(age time.Duration) string {
+		r := &record.Share{Token: record.NewToken(), Created: time.Now().Add(-age)}
+		if err := record.Create(r); err != nil {
+			t.Fatal(err)
+		}
+		return r.ID
+	}
+	old, keep, fresh := mk(time.Hour), mk(time.Hour), mk(time.Second)
+	pruneStale(keep)
+	for id, want := range map[string]bool{old: false, keep: true, fresh: true} {
+		if _, err := record.Load(id); (err == nil) != want {
+			t.Errorf("record %s kept %v, want %v", id, err == nil, want)
+		}
+	}
+}
+
+func TestTailLogFollowsATruncation(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	p, err := record.Path("hub.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	got := make(chan string, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tailLog(ctx, "abc123", time.Now().Add(-time.Minute), true, func(_ time.Time, msg string) { got <- msg })
+	next := func() string {
+		select {
+		case m := <-got:
+			return m
+		case <-time.After(5 * time.Second):
+			return "(nothing)"
+		}
+	}
+	shareLogger(f, "abc123").Print("first, and long enough to matter")
+	if m := next(); m != "first, and long enough to matter" {
+		t.Fatalf("got %q", m)
+	}
+	// What openLog does on Windows when it cannot rename: truncate in place.
+	if err := os.Truncate(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	g, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	time.Sleep(400 * time.Millisecond) // let the follower see the shorter file first
+	shareLogger(g, "abc123").Print("second")
+	if m := next(); m != "second" {
+		t.Fatalf("after truncation got %q", m)
+	}
+}

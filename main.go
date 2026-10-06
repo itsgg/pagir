@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -46,6 +47,7 @@ Flags:
 `
 
 const (
+	staleAfter      = 15 * time.Second // a record no hub serves, older than this, is from a hub that ended
 	defaultLifetime = 24 * time.Hour
 	announceWait    = 8 * time.Second // how long a new share waits for the public check before handing it to the hub
 )
@@ -171,7 +173,7 @@ func cmdShare(args []string) error {
 	if fg {
 		go attached(ctx, id)
 	}
-	if err := ensureHub(); err != nil {
+	if err := ensureHub(id); err != nil {
 		record.Remove(id)
 		return err
 	}
@@ -263,11 +265,34 @@ func hubTarget(public bool) string {
 
 // ensureHub starts the hub unless one runs. Two pagirs racing to start it
 // is fine: the second supervisor finds the lock taken and leaves.
-func ensureHub() error {
+func ensureHub(keep string) error {
 	if hubRunning() {
 		return nil
 	}
+	return startFreshHub(keep)
+}
+
+// startFreshHub starts a hub after removing the records no hub has served:
+// a hub that is not running ended (logout, reboot, a supervisor that gave
+// up), and a new one must not republish the shares it took down. A record
+// younger than staleAfter may belong to a pagir starting the hub right now,
+// and keep is the share this pagir is starting.
+func startFreshHub(keep string) error {
+	pruneStale(keep)
 	return startHub()
+}
+
+// pruneStale removes the records older than staleAfter, except keep.
+func pruneStale(keep string) {
+	recs, err := record.List()
+	if err != nil {
+		return
+	}
+	for _, rec := range recs {
+		if rec.ID != keep && time.Since(rec.Created) > staleAfter {
+			record.Remove(rec.ID)
+		}
+	}
 }
 
 // waitReady waits until the hub reports the share live, starting the hub
@@ -302,7 +327,7 @@ func waitReady(ctx context.Context, id string) error {
 			return fmt.Errorf("the hub keeps stopping; the end of its log:\n%s", logTail(15))
 		}
 		starts, down = starts+1, 0
-		if err := startHub(); err != nil {
+		if err := startFreshHub(id); err != nil {
 			return err
 		}
 	}
@@ -474,11 +499,10 @@ func cmdList() error {
 	}
 	h, _ := record.LoadHub()
 	running := hubRunning()
-	boot, knowBoot := platform.BootTime()
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	n := 0
 	for _, rec := range recs {
-		if (knowBoot && rec.Created.Before(boot.Add(-bootSlack))) || (!running && time.Since(rec.Created) > 15*time.Second) {
+		if !running && time.Since(rec.Created) > staleAfter {
 			record.Remove(rec.ID) // nothing serves it any more
 			continue
 		}
@@ -659,9 +683,11 @@ func tailLog(ctx context.Context, id string, since time.Time, follow bool, fn fu
 	defer func() { f.Close() }()
 	r := bufio.NewReader(f)
 	var partial string
+	var pos int64 // bytes of f read so far
 	for {
 		chunk, err := r.ReadString('\n')
 		partial += chunk
+		pos += int64(len(chunk))
 		if err == nil {
 			emit(strings.TrimRight(partial, "\r\n"))
 			partial = ""
@@ -678,13 +704,19 @@ func tailLog(ctx context.Context, id string, since time.Time, follow bool, fn fu
 			return nil
 		case <-time.After(300 * time.Millisecond):
 		}
-		// A new supervisor moves hub.log aside past logLimit: follow the new one.
+		// A new supervisor moves hub.log aside past logLimit, or on Windows
+		// copies and truncates it: follow the new one, or start the
+		// truncated one over.
 		if cur, err1 := f.Stat(); err1 == nil {
 			if now, err2 := os.Stat(p); err2 == nil && !os.SameFile(cur, now) {
 				if nf, err3 := os.Open(p); err3 == nil {
 					f.Close()
-					f, r, partial = nf, bufio.NewReader(nf), ""
+					f, r, partial, pos = nf, bufio.NewReader(nf), "", 0
 				}
+			} else if cur.Size() < pos {
+				f.Seek(0, io.SeekStart)
+				r.Reset(f)
+				partial, pos = "", 0
 			}
 		}
 	}

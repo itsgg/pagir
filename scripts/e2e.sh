@@ -89,11 +89,6 @@ check "warm share says public" 1 "$(command grep -c ', public,' "$work/err")"
 check "warm share is quick" 1 "$(( $(date +%s) - t0 < 6 ? 1 : 0 ))"
 check "warm share prints two lines" 2 "$(( $(wc -l <"$work/out") + $(wc -l <"$work/err") ))"
 
-# A record from before the last boot is dropped, never served.
-jq '.id = "00b007" | .created = "2000-01-01T00:00:00Z"' "$state/$(idof "$file").json" >"$state/00b007.json"
-sleep 2.5
-check "earlier boot's record dropped" "" "$(ls "$state" | command grep 00b007)"
-
 tailid=$(idof "$tail")
 "$pagir" stop "$tailid" >/dev/null 2>&1
 check "stop: that share is gone" gone "$(gone "${tail}a.txt")"
@@ -143,6 +138,16 @@ if [ "$foreign" -eq 0 ]; then
 	check "hub crash drops the mount" "[]" "$(mounts)"
 	timeout 30 bash -c "until curl -sf -m 3 -o /dev/null '${dir}a.txt'; do sleep 1; done"
 	check "hub crash: the supervisor brings it back" 0 $?
+	# A hub that ended (here its supervisor is killed) took its shares
+	# down; the next hub starts clean instead of republishing them.
+	child=$(jq -r .pid "$state/hub.json")
+	kill -9 "$(awk '{print $4}' "/proc/$child/stat")"
+	sleep 2
+	check "a killed supervisor takes its hub down" gone "$(gone "${dir}a.txt")"
+	sleep 16 # past staleAfter, so the old record counts as stale
+	share -e 10m "$work/other/report.txt"
+	check "a fresh hub serves the new share" report "$(curl -sS -m 10 "$URL")"
+	check "a fresh hub does not republish the old one" gone "$(gone "${dir}a.txt")"
 	"$pagir" stop hub >"$work/out" 2>&1
 	mine=()
 	check "stop hub frees port 443" 1 "$(command grep -c 'port 443 is free' "$work/out")"

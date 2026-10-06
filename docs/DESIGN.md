@@ -41,12 +41,18 @@ each file with one writer:
   by the CLI to ask for a notification.
 - tailscaled's serve config, changed only by the hub's tailscale children.
 
+The supervisor keeps `hub.log` near 5 MB by moving it to `hub.log.1` when
+it starts; where the system refuses the move because a `pagir log -f` has
+the file open (Windows), it copies and truncates instead, and the follower
+starts the truncated file over.
+
 `pagir PATH` writes the record and, if no supervisor holds `hub.lock`,
-starts one detached: `pagir hub`. The supervisor runs the hub itself
+removes the records older than 15 seconds (no hub served them, so they
+belong to a hub that ended) and starts one detached: `pagir hub`. The supervisor runs the hub itself
 (`pagir hub --child`) and restarts it after a crash. Once a second, the hub
 lists the records and makes its routing table match them: it drops a
-record that expired, that was made before the last boot, or whose
-foreground terminal stopped touching it ten seconds ago; it opens each new
+record that expired, or whose foreground terminal stopped touching it ten
+seconds ago; it opens each new
 share as a `web.Server`; it closes shares whose record has gone. It holds
 two local listeners, one per lane:
 
@@ -110,12 +116,15 @@ files once a second costs nothing. `stop` waits until `hub.json` drops the
 share, so it returns when the share is really gone; `stop hub` leaves
 `hub.stop` and waits for the lock to go.
 
-**Records die with the boot.** A record made before the machine last
-booted is dropped, by comparing its creation time with the boot time
-(`/proc/stat` on Linux, `kern.boottime` on macOS, the tick count on
-Windows). Shares are running things: after a reboot no hub runs, and the
-next share would otherwise start a hub that silently republishes every old
-record.
+**Records die with the hub.** A hub that is not running has ended: a
+logout, a reboot, a supervisor that gave up, `pagir stop hub`. Shares are
+running things, so when a CLI finds no hub, it removes the records older
+than 15 seconds before it starts one; otherwise the new hub would silently
+republish what the old one took down. A record younger than that may
+belong to a pagir starting the hub at the same moment. The first version
+compared each record with the boot time instead, which needed code per
+system, missed logouts, and on Windows may miss a Fast Startup "shutdown",
+which hibernates rather than reboots.
 
 **A foreground share is a file its terminal touches.** Checking the
 terminal's pid would need /proc to rule out a reused pid. A modification

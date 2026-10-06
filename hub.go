@@ -32,7 +32,6 @@ const (
 	childBackoff = 3 * time.Second
 	publicWatch  = 5 * time.Minute  // how long the hub checks a new share's public addresses
 	attachedFor  = 10 * time.Second // a foreground share whose terminal has not touched it for this long is over
-	bootSlack    = time.Minute      // boot time moves with the wall clock; small steps must not drop live shares
 )
 
 // The hub serves every share. tailscaled allows one foreground listener per
@@ -192,13 +191,9 @@ func (h *hub) sync(ctx context.Context) {
 	wall := now.Round(0)
 	slept := !h.lastSync.IsZero() && wall.Sub(h.lastSync) > attachedFor/2
 	h.lastSync = wall
-	boot, knowBoot := platform.BootTime()
 	want := map[string]*record.Share{}
 	for _, rec := range recs {
 		switch {
-		case knowBoot && rec.Created.Before(boot.Add(-bootSlack)):
-			record.Remove(rec.ID)
-			h.logger.Printf("%s dropped: made before the last reboot", rec.ID)
 		case rec.Expired(now):
 			record.Remove(rec.ID)
 			h.logger.Printf("%s expired", rec.ID)

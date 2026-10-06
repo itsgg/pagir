@@ -301,3 +301,22 @@ func TestSingleFile(t *testing.T) {
 		t.Error("Upload on a file share was accepted")
 	}
 }
+
+func TestZipOfUnreadableFolderIs500(t *testing.T) {
+	root, _ := tree(t)
+	s := server(t, Config{Root: root})
+	locked := filepath.Join(root, "sub")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	if _, err := os.ReadDir(locked); err == nil {
+		t.Skip("this system or user can read a mode-0 folder")
+	}
+	r := httptest.NewRequest("GET", "http://x/tok/sub/?zip", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("zip of an unreadable folder: %d, want 500", w.Code)
+	}
+}

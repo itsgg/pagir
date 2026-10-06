@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -87,10 +86,6 @@ func TryLock(path string) (unlock func(), ok bool, err error) {
 // Unroutable reports a dial that cannot leave this machine at all.
 func Unroutable(err error) bool {
 	return errors.Is(err, windows.WSAENETUNREACH) || errors.Is(err, windows.WSAEHOSTUNREACH) || errors.Is(err, windows.WSAEADDRNOTAVAIL)
-}
-
-func bootTime() (time.Time, error) {
-	return time.Now().Add(-windows.DurationSinceBoot()).Truncate(time.Second), nil
 }
 
 func clipboard() []string { return []string{"clip"} }

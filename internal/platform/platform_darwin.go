@@ -3,9 +3,6 @@ package platform
 import (
 	"os/exec"
 	"strconv"
-	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // The Mac App Store and standalone apps ship the CLI inside the bundle.
@@ -18,14 +15,6 @@ var tailscaleFallbacks = []string{
 // TieToParent has no macOS equivalent of Pdeathsig; the supervisor's
 // KillGroup ends a child its hub leaves behind.
 func TieToParent(cmd *exec.Cmd) {}
-
-func bootTime() (time.Time, error) {
-	tv, err := unix.SysctlTimeval("kern.boottime")
-	if err != nil {
-		return time.Time{}, err
-	}
-	return time.Unix(tv.Unix()), nil
-}
 
 func clipboard() []string { return []string{"pbcopy"} }
 

@@ -138,7 +138,13 @@ func openLog() (*os.File, error) {
 		return nil, err
 	}
 	if fi, err := os.Stat(p); err == nil && fi.Size() > logLimit {
-		os.Rename(p, p+".1")
+		if os.Rename(p, p+".1") != nil {
+			// Windows refuses to rename a file someone has open, such as a
+			// pagir log -f. Nothing writes to it yet, so copy and truncate.
+			if data, err := os.ReadFile(p); err == nil && os.WriteFile(p+".1", data, 0o600) == nil {
+				os.Truncate(p, 0)
+			}
+		}
 	}
 	return os.OpenFile(p, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 }

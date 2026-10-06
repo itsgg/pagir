@@ -18,7 +18,7 @@ forced by something that failed.
 - `internal/record`: share records (CLI writes) and `hub.json` (hub writes).
 - `internal/tailnet`: the tailscale CLI, serve-config parsing, public probes.
 - `internal/platform`: what differs on Linux, macOS and Windows (detaching,
-  tying children to the hub, locks, boot time, clipboard, notifications).
+  tying children to the hub, locks, clipboard, notifications).
 
 ## Commands
 
