@@ -384,6 +384,16 @@ func announce(ctx context.Context, rec *record.Share, showQR bool) (checked bool
 		case st.PublicErr != "" && st.Reached == 0:
 			facts = append(facts, "tailnet only for now")
 			later = "not public yet: " + st.PublicErr
+		case st.NoDNS:
+			checked = false
+			facts = append(facts, "tailnet only for now")
+			later = "not public yet: Tailscale has not published " + hostOf(rec.URL) + " in public DNS, which can take a quarter of an hour; "
+			if rec.Foreground {
+				later += "this terminal says when it is public"
+			} else {
+				record.MarkNotify(rec.ID)
+				later += "a notification follows when it is public"
+			}
 		case st.PublicErr != "":
 			facts = append(facts, fmt.Sprintf("public through %d of %d addresses", st.Reached, st.Of))
 			later = "some visitors cannot reach it: " + st.PublicErr
@@ -425,6 +435,15 @@ func announce(ctx context.Context, rec *record.Share, showQR bool) (checked bool
 	return checked
 }
 
+// hostOf is the host name in a share's URL.
+func hostOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	return u.Hostname()
+}
+
 // waitPublic follows the hub's check of a share's public addresses for up
 // to announceWait and returns how far it got.
 func waitPublic(ctx context.Context, id string) record.Status {
@@ -433,7 +452,7 @@ func waitPublic(ctx context.Context, id string) record.Status {
 	for time.Now().Before(deadline) {
 		if h, err := record.LoadHub(); err == nil {
 			st = h.Shares[id]
-			if st.Public || (st.PublicErr != "" && st.Reached == 0) {
+			if st.Public || st.NoDNS || (st.PublicErr != "" && st.Reached == 0) {
 				return st
 			}
 		}
@@ -485,10 +504,39 @@ func follow(ctx context.Context, rec *record.Share, checked bool) {
 					fmt.Fprintf(os.Stderr, "%s public through all %d addresses\n", time.Now().Format("15:04:05"), st.Of)
 				case st.PublicErr != "":
 					checked = true
-					fmt.Fprintf(os.Stderr, "%s public through %d of %d addresses; the check ended: %s\n", time.Now().Format("15:04:05"), st.Reached, st.Of, st.PublicErr)
+					fmt.Fprintf(os.Stderr, "%s %s\n", time.Now().Format("15:04:05"), checkEnded(st))
 				}
 			}
 		}
+	}
+}
+
+// checkEnded says how a public check that did not reach every address
+// ended, for a foreground share's terminal.
+func checkEnded(st record.Status) string {
+	if st.Of == 0 {
+		return "not public; the check ended: " + st.PublicErr
+	}
+	return fmt.Sprintf("public through %d of %d addresses; the check ended: %s", st.Reached, st.Of, st.PublicErr)
+}
+
+// listState is a share's STATE in pagir ls, from what the running hub says.
+func listState(rec *record.Share, st record.Status) string {
+	switch {
+	case st.Error != "":
+		return "failing"
+	case !st.Ready:
+		return "starting"
+	case !rec.Public || st.Public:
+		return "live"
+	case st.NoDNS:
+		return "live, waiting for public DNS"
+	case st.Of > 0:
+		return fmt.Sprintf("live, public %d/%d", st.Reached, st.Of)
+	case st.PublicErr != "":
+		return "live, not public"
+	default:
+		return "live, checking public"
 	}
 }
 
@@ -508,17 +556,7 @@ func cmdList() error {
 		}
 		state := "starting"
 		if st, ok := h.Shares[rec.ID]; ok && running {
-			switch {
-			case st.Error != "":
-				state = "failing"
-			case !st.Ready:
-			case !rec.Public || st.Public:
-				state = "live"
-			case st.Of > 0:
-				state = fmt.Sprintf("live, public %d/%d", st.Reached, st.Of)
-			default:
-				state = "live, checking public"
-			}
+			state = listState(rec, st)
 		}
 		left := "never"
 		switch {

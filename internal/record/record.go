@@ -213,11 +213,14 @@ func Remove(id string) error {
 	return nil
 }
 
-// Status is the hub's view of one share. For a public share, Reached of Of
-// public Funnel addresses have answered so far; Public means all of them.
+// Status is the hub's view of one share. For a public share, NoDNS means
+// the hub is waiting for the host's public DNS record; after that, Reached
+// of Of public Funnel addresses have answered so far, and Public means all
+// of them.
 type Status struct {
 	Ready     bool   `json:"ready,omitempty"`
 	Error     string `json:"error,omitempty"`
+	NoDNS     bool   `json:"no_dns,omitempty"`
 	Reached   int    `json:"reached,omitempty"`
 	Of        int    `json:"of,omitempty"`
 	Public    bool   `json:"public,omitempty"`

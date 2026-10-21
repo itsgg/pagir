@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -104,11 +105,14 @@ func cmdDoctor() bool {
 		say("ok", "the hub is not running; it starts with the first share")
 	}
 
-	if addrs, err := tailnet.PublicDNS(ctx, host); err == nil && len(addrs) > 0 {
+	switch addrs, err := tailnet.PublicDNS(ctx, host); {
+	case err == nil:
 		say("ok", "%s resolves publicly (%s)", host, strings.Join(addrs, ", "))
-	} else {
+	case errors.Is(err, tailnet.ErrNoRecord):
 		say("warn", "%s has no public DNS record, so only your tailnet can open links; "+
-			"Tailscale publishes it while a funnel is on, which can take minutes the first time", host)
+			"Tailscale publishes it while a funnel is on, which can take a quarter of an hour", host)
+	default:
+		say("warn", "cannot check public DNS: %v", err)
 	}
 
 	if dir, err := record.Dir(); err != nil {
