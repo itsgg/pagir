@@ -64,10 +64,12 @@ two local listeners, one per lane:
 Each request is routed by the token in its first path segment, and only
 on its own lane, so a tailnet-only token gets a 404 through Funnel.
 
-Once a public share's lane is mounted, the hub checks it through every
-public Funnel address, for up to five minutes. The CLI waits up to eight
-seconds for that check. If it ends in time the CLI says "public"; if not,
-it says how many addresses answered so far, leaves `<id>.notify`, and
+Once a public share's lane is mounted, the hub waits up to thirty minutes
+for the host's public DNS record, then checks the share through every
+public Funnel address for up to five. The CLI waits up to eight seconds
+for that check. If it ends in time the CLI says "public"; if the record is
+missing it says so at once; otherwise it says how many addresses answered
+so far. In both of the last two cases it leaves `<id>.notify` and
 returns, and the hub sends a desktop notification when the check ends.
 
 ## Decisions
@@ -133,11 +135,22 @@ time older than ten seconds means the terminal is gone, on any system.
 **Public means every Funnel address answers.** After a funnel starts, each
 ingress node learns of it on its own schedule; for tens of seconds one of
 the host's public addresses answered while another dropped the TLS
-handshake. The hub probes each address from public DNS (asked of 1.1.1.1
-directly, since the local resolver answers from MagicDNS), and a share is
+handshake. The hub probes each address from public DNS, and a share is
 "public" only when all answer. An address this machine cannot route to,
 such as IPv6 without IPv6, is left out. Its probes carry the User-Agent
 `pagir-probe` and stay out of the access log.
+
+**Public DNS is asked of ts.net's own nameservers, every one of them.**
+The local resolver answers from MagicDNS, so it says yes while strangers
+get NXDOMAIN. The first version asked 1.1.1.1 once and gave up on a miss,
+after one second of a five-minute check; and a public resolver keeps a
+miss for the five minutes ts.net's SOA allows, so that one early lookup
+also hid the name from every visitor sharing the cache. The hub now finds
+the zone's nameservers through 1.1.1.1, asking only about the domains above
+the tailnet's (a missing domain, under RFC 8020, can hide everything below
+it), and asks each nameserver directly every two seconds. The record counts
+once every nameserver that answers has its IPv4 addresses; IPv6 ones are
+added when present.
 
 **Say what was checked, and no more.** The first version waited 45
 seconds, then printed the raw Go error and "the rest usually follow within
@@ -185,10 +198,14 @@ shaped the code above.
 - **Ingress nodes learn of a funnel at different times.** For tens of
   seconds after a funnel starts, one public address of the host can answer
   while another drops the TLS handshake.
-- **Public DNS can lag the first funnel.** A node's name resolves publicly
-  only once Tailscale publishes its record. On the machine pagir was built
-  on, it was still missing a minute after the first funnel's certificate
-  arrived.
+- **Public DNS can lag a funnel by a quarter of an hour.** A node's name
+  resolves publicly only while Tailscale publishes its record, and it was
+  gone after two weeks with no funnel. On 2026-10-21 tailscaled logged
+  `Hostinfo.IngressEnabled changed to true` at 17:47:54, and the ts.net
+  nameservers first answered between 18:04:11 and 18:04:41, against the
+  "up to 10 minutes" Tailscale documents. For at least a minute after that
+  they disagreed: one returned only the IPv6 addresses, then NXDOMAIN
+  again, while the other three had all four.
 - **`--set-path` is stripped before proxying.** A mount at `/x` proxying
   to `http://127.0.0.1:8080/y` sends `/x/a` to `/y/a`. The hub mounts `/`,
   so it sees the token itself.

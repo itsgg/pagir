@@ -46,7 +46,10 @@ idof() { basename "$(command grep -l "\"url\": \"$1\"" "$state"/*.json 2>/dev/nu
 foreign=$(ids | wc -l)
 [ "$foreign" -gt 0 ] && echo "note  $foreign share(s) made elsewhere stay up; the crash and stop-hub checks are skipped"
 host=$(tailscale status --json | jq -r '.Self.DNSName | rtrimstr(".")')
-ip=$(curl -sS -m 8 "https://dns.google/resolve?name=$host&type=A" | jq -r '.Answer[0].data // empty')
+# An IPv4 address from doctor, which asks ts.net's own nameservers: a public
+# resolver asked before the record exists would remember the miss for five
+# minutes, for every visitor sharing its cache.
+ip=$("$pagir" doctor 2>&1 | sed -n "s/.* $host resolves publicly (\(.*\))$/\1/p" | tr ', ' '\n\n' | command grep -m1 -E '^[0-9.]+$')
 [ -n "$ip" ] || { echo "no public A record for $host: run pagir doctor"; exit 1; }
 public=(--resolve "$host:443:$ip" --resolve "$host:8443:$ip")
 

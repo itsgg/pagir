@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -30,7 +31,8 @@ const (
 	hubTick      = time.Second
 	mountWait    = 60 * time.Second
 	childBackoff = 3 * time.Second
-	publicWatch  = 5 * time.Minute  // how long the hub checks a new share's public addresses
+	dnsWatch     = 30 * time.Minute // how long the hub waits for Tailscale to publish the host's public DNS record
+	publicWatch  = 5 * time.Minute  // how long the hub then checks a new share's public addresses
 	attachedFor  = 10 * time.Second // a foreground share whose terminal has not touched it for this long is over
 )
 
@@ -67,6 +69,7 @@ type publicCheck struct {
 	cancel      context.CancelFunc
 	started     time.Time
 	took        time.Duration
+	noDNS       bool // waiting for the host's public DNS record
 	reached, of int
 	done        bool
 	err         string
@@ -282,12 +285,34 @@ func (h *hub) checkPublic(ctx context.Context) {
 	}
 }
 
+// The waits of a public check; tests replace them.
+var (
+	waitForDNS   = tailnet.WaitDNS
+	waitForAddrs = tailnet.WaitPublic
+)
+
 func (h *hub) runCheck(ctx context.Context, rec *record.Share, c *publicCheck) {
-	reached, of, err := tailnet.WaitPublic(ctx, h.host, rec.URL, publicWatch, func(reached, of int) {
+	missed := false
+	addrs, err := waitForDNS(ctx, h.host, dnsWatch, func(err error) {
 		h.mu.Lock()
-		c.reached, c.of = reached, of
+		c.noDNS = errors.Is(err, tailnet.ErrNoRecord)
+		missed = missed || c.noDNS
 		h.mu.Unlock()
 	})
+	h.mu.Lock()
+	c.noDNS = false
+	h.mu.Unlock()
+	var reached, of int
+	if err == nil {
+		if missed {
+			h.logger.Printf("%s is in public DNS after %s", h.host, time.Since(c.started).Round(time.Second))
+		}
+		reached, of, err = waitForAddrs(ctx, addrs, rec.URL, publicWatch, func(reached, of int) {
+			h.mu.Lock()
+			c.reached, c.of = reached, of
+			h.mu.Unlock()
+		})
+	}
 	if ctx.Err() != nil {
 		return // the share ended or its lane lost the mount
 	}
@@ -412,7 +437,7 @@ func (h *hub) publish(want map[string]*record.Share) {
 			st.Error = l.err
 		}
 		if s := h.byID[id]; s != nil && s.check != nil {
-			st.Reached, st.Of = s.check.reached, s.check.of
+			st.Reached, st.Of, st.NoDNS = s.check.reached, s.check.of, s.check.noDNS
 			st.Public = s.check.done && s.check.err == "" && s.check.of > 0
 			st.PublicErr = s.check.err
 		}

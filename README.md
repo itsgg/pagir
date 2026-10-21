@@ -54,7 +54,7 @@ sudo tailscale set --operator=$USER
 ```
 
 `pagir doctor` checks all of that, plus whether the machine's name resolves
-in public DNS, which Tailscale publishes only after the first funnel.
+in public DNS, which Tailscale publishes only while a funnel is on.
 
 CI builds and tests pagir on all three systems. The live tests, which open
 real funnels, have run on Linux only so far.
@@ -74,7 +74,9 @@ folder, symlinks included.
 A new share is called public only once every public Funnel address
 answers. When that takes longer than a few seconds, the first share after
 a reboot, pagir says how many answered so far and sends a desktop
-notification when the rest do. [docs/DESIGN.md](docs/DESIGN.md) has the
+notification when the rest do. After a long spell with no funnel, Tailscale
+can take a quarter of an hour to publish the machine's name in public DNS;
+pagir says so and waits for it. [docs/DESIGN.md](docs/DESIGN.md) has the
 reasons behind each choice.
 
 ## Develop

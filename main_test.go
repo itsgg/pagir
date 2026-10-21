@@ -154,3 +154,49 @@ func TestTailLogFollowsATruncation(t *testing.T) {
 		t.Fatalf("after truncation got %q", m)
 	}
 }
+
+func TestWaitPublicStopsOnMissingDNS(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	// The record takes minutes to appear, so waiting out announceWait for
+	// it only delays the line that says so.
+	if err := record.SaveHub(&record.Hub{Shares: map[string]record.Status{"aaaaaa": {Ready: true, NoDNS: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if st := waitPublic(context.Background(), "aaaaaa"); !st.NoDNS || time.Since(start) > announceWait/2 {
+		t.Errorf("waitPublic returned %+v after %s", st, time.Since(start))
+	}
+	if h := hostOf("https://host.tail0000.ts.net/tok/a.txt"); h != "host.tail0000.ts.net" {
+		t.Errorf("hostOf: %q", h)
+	}
+}
+
+func TestListStateAndCheckEnded(t *testing.T) {
+	pub := &record.Share{Public: true}
+	for _, c := range []struct {
+		st   record.Status
+		want string
+	}{
+		{record.Status{Error: "x"}, "failing"},
+		{record.Status{}, "starting"},
+		{record.Status{Ready: true, Public: true, Reached: 4, Of: 4}, "live"},
+		{record.Status{Ready: true, NoDNS: true}, "live, waiting for public DNS"},
+		{record.Status{Ready: true, Reached: 2, Of: 4}, "live, public 2/4"},
+		// The wait for a DNS record ran out: nothing was checked.
+		{record.Status{Ready: true, PublicErr: "h has no public DNS record"}, "live, not public"},
+		{record.Status{Ready: true}, "live, checking public"},
+	} {
+		if got := listState(pub, c.st); got != c.want {
+			t.Errorf("%+v: %q, want %q", c.st, got, c.want)
+		}
+	}
+	if got := listState(&record.Share{}, record.Status{Ready: true}); got != "live" {
+		t.Errorf("tailnet-only share: %q", got)
+	}
+	if got := checkEnded(record.Status{PublicErr: "h has no public DNS record"}); got != "not public; the check ended: h has no public DNS record" {
+		t.Errorf("checkEnded without addresses: %q", got)
+	}
+	if got := checkEnded(record.Status{Reached: 2, Of: 4, PublicErr: "x"}); got != "public through 2 of 4 addresses; the check ended: x" {
+		t.Errorf("checkEnded with addresses: %q", got)
+	}
+}

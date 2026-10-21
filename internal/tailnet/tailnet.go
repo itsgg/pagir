@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -184,33 +185,188 @@ func Operator(ctx context.Context) (string, error) {
 	return p.OperatorUser, nil
 }
 
-// PublicDNS asks 1.1.1.1 directly whether host resolves. The local resolver
-// would answer from MagicDNS and say yes even when strangers get NXDOMAIN.
+// ErrNoRecord means a nameserver of the host's zone does not have its
+// record yet.
+var ErrNoRecord = errors.New("no public DNS record")
+
+// PublicDNS asks every nameserver of host's zone for its addresses, which
+// is where strangers' resolvers learn them. The local resolver would answer
+// from MagicDNS and say yes even when strangers get NXDOMAIN, and a public
+// resolver would remember a miss: ts.net's are kept five minutes, for
+// pagir's next lookup and for every visitor who shares that cache. The
+// record counts only when every nameserver that answers has it; while any
+// lacks it, the error wraps ErrNoRecord. They do not agree at once: on
+// 2026-10-21 one still lacked a new record a minute after the others had it.
 func PublicDNS(ctx context.Context, host string) ([]string, error) {
-	r := &net.Resolver{
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	servers, err := nameservers(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	for i, s := range servers {
+		servers[i] = net.JoinHostPort(s, "53")
+	}
+	return askAll(ctx, host, servers)
+}
+
+// askAll asks each server, an address with its port, for host at once.
+func askAll(ctx context.Context, host string, servers []string) ([]string, error) {
+	answers := make([]answer, len(servers))
+	var wg sync.WaitGroup
+	for i, s := range servers {
+		wg.Go(func() { answers[i] = lookupAt(ctx, s, host) })
+	}
+	wg.Wait()
+	return published(host, answers)
+}
+
+// lookupAt asks one nameserver for host's addresses. Its IPv4 addresses
+// must be there and its IPv6 ones are added if it gives them: on 2026-10-21
+// a nameserver had a new record's IPv6 addresses before its IPv4 ones.
+func lookupAt(ctx context.Context, server, host string) answer {
+	r := resolver(server)
+	v4, err := r.LookupIP(ctx, "ip4", host+".")
+	if err != nil {
+		return answer{err: err}
+	}
+	v6, _ := r.LookupIP(ctx, "ip6", host+".") // none, or a failed query: its IPv4 answer stands
+	var a answer
+	for _, ip := range append(v4, v6...) {
+		a.addrs = append(a.addrs, ip.String())
+	}
+	return a
+}
+
+// answer is one nameserver's reply to a lookup.
+type answer struct {
+	addrs []string
+	err   error
+}
+
+// published combines the nameservers' answers: every address any of them
+// gave, or ErrNoRecord if any says the name has no IPv4 address. One that
+// gave no such answer is left out: one this machine cannot reach, or one
+// that answers SERVFAIL or a referral, after which a visitor's resolver
+// asks another.
+func published(host string, answers []answer) ([]string, error) {
+	var addrs []string
+	var last error
+	answered := 0
+	for _, a := range answers {
+		var dns *net.DNSError
+		switch {
+		case a.err == nil:
+			answered++
+			addrs = append(addrs, a.addrs...)
+		case errors.As(a.err, &dns) && dns.IsNotFound:
+			return nil, fmt.Errorf("%s has %w", host, ErrNoRecord)
+		case errors.As(a.err, &dns):
+			last = errors.New(dns.Err) // its Server is the system's resolver, not the one asked
+		default:
+			last = a.err
+		}
+	}
+	if answered == 0 {
+		return nil, fmt.Errorf("no nameserver of %s answered: %v", host, last)
+	}
+	slices.Sort(addrs)
+	return slices.Compact(addrs), nil
+}
+
+// nameservers finds the nameservers of the zone that holds host, a name
+// such as node.tailnet.ts.net. It asks 1.1.1.1 only about the domains above
+// the tailnet's: a resolver remembers a miss for minutes, and one that
+// follows RFC 8020 takes a missing domain to mean nothing below it exists.
+func nameservers(ctx context.Context, host string) ([]string, error) {
+	for _, zone := range zonesAbove(host) {
+		ns, err := resolver("1.1.1.1:53").LookupNS(ctx, zone)
+		var dns *net.DNSError
+		if errors.As(err, &dns) && dns.IsNotFound {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("finding the nameservers of %s: %v", zone, err)
+		}
+		out := make([]string, len(ns))
+		for i, n := range ns {
+			out[i] = n.Host
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("no zone above %s has nameservers", host)
+}
+
+// zonesAbove lists the domains above host's tailnet domain, nearest first.
+func zonesAbove(host string) []string {
+	labels := strings.Split(strings.TrimSuffix(host, "."), ".")
+	var out []string
+	for i := 2; i < len(labels)-1; i++ {
+		out = append(out, strings.Join(labels[i:], ".")+".")
+	}
+	return out
+}
+
+// resolver sends every query to server, whatever the system's resolver
+// configuration names.
+func resolver(server string) *net.Resolver {
+	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var d net.Dialer
-			return d.DialContext(ctx, network, "1.1.1.1:53")
+			return d.DialContext(ctx, network, server)
 		},
 	}
-	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	return r.LookupHost(ctx, host)
 }
 
-// WaitPublic waits until url answers through every public address of host,
-// the way strangers reach it. Each Funnel ingress node learns of a new
-// funnel on its own schedule, so for a while after one starts some addresses
-// answer and others do not; one answer proves little. An address this
-// machine cannot route to at all, such as IPv6 without IPv6, is left out.
-// It returns how many addresses answered out of how many were tried, and
-// reports the same after every round to progress, which may be nil.
-func WaitPublic(ctx context.Context, host, url string, wait time.Duration, progress func(answered, tried int)) (answered, tried int, err error) {
-	addrs, err := PublicDNS(ctx, host)
-	if err != nil || len(addrs) == 0 {
-		return 0, 0, fmt.Errorf("%s has no public DNS record", host)
+// lookup is PublicDNS; tests replace it.
+var lookup = PublicDNS
+
+// dnsRetry is how long WaitDNS waits between lookups.
+var dnsRetry = 2 * time.Second
+
+// WaitDNS looks host up until every nameserver of its zone has its record,
+// for up to wait, and returns its public addresses. Tailscale publishes the
+// record while a funnel is on; its documentation says a new one can take up
+// to ten minutes to appear, and on 2026-10-21, after two weeks without a
+// funnel, it took sixteen. After each lookup that fails, miss, which may be
+// nil, hears why.
+func WaitDNS(ctx context.Context, host string, wait time.Duration, miss func(error)) ([]string, error) {
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	var last error
+	for {
+		addrs, err := lookup(ctx, host)
+		if err == nil {
+			return addrs, nil
+		}
+		if ctx.Err() == nil || last == nil {
+			last = err // not one the deadline cut short, unless it is all there is
+		}
+		if miss != nil {
+			miss(err)
+		}
+		select {
+		case <-ctx.Done():
+			if parent.Err() != nil {
+				return nil, parent.Err()
+			}
+			return nil, last
+		case <-time.After(dnsRetry):
+		}
 	}
+}
+
+// WaitPublic waits until url answers through every one of addrs, the
+// host's public addresses, the way strangers reach it. Each Funnel ingress
+// node learns of a new funnel on its own schedule, so for a while after one
+// starts some addresses answer and others do not; one answer proves little.
+// An address this machine cannot route to at all, such as IPv6 without
+// IPv6, is left out. It returns how many addresses answered out of how many
+// were tried, and reports the same after every round to progress, which may
+// be nil.
+func WaitPublic(ctx context.Context, addrs []string, url string, wait time.Duration, progress func(answered, tried int)) (answered, tried int, err error) {
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	pending := map[string]bool{}
